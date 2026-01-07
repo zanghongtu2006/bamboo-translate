@@ -1,50 +1,61 @@
 ﻿using System;
-using System.Diagnostics;
+using System.IO;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Threading.Tasks;
 using System.Windows;
+using System.Windows.Documents;
+using System.Windows.Controls;
 
 namespace BambooTrans.Services
 {
     public static class ClipboardHelper
     {
-        // -------- SendInput: 模拟 Ctrl+C ----------
+        // ---- SendInput: Ctrl+C ----
         public static void SimulateCopy()
         {
             var inputs = new INPUT[4];
-            inputs[0] = KeyDown(VK_CONTROL);
+            inputs[0] = KeyDown(0x11); // Ctrl
             inputs[1] = KeyDown(0x43); // 'C'
             inputs[2] = KeyUp(0x43);
-            inputs[3] = KeyUp(VK_CONTROL);
+            inputs[3] = KeyUp(0x11);
             SendInput((uint)inputs.Length, inputs, Marshal.SizeOf(typeof(INPUT)));
         }
 
-        // 复制后等待剪贴板“确实改变”，再读取文本
+        // ---- SendInput: Ctrl+Insert（兜底）----
+        public static void SimulateCopyCtrlInsert()
+        {
+            var inputs = new INPUT[4];
+            inputs[0] = KeyDown(0x11); // Ctrl
+            inputs[1] = KeyDown(0x2D); // Insert
+            inputs[2] = KeyUp(0x2D);
+            inputs[3] = KeyUp(0x11);
+            SendInput((uint)inputs.Length, inputs, Marshal.SizeOf(typeof(INPUT)));
+        }
+
+        // 复制并等待“剪贴板序号变化”，变化后读取文本（兼容 HTML/RTF）
         public static async Task<(bool changed, string text)> CopyThenReadAsync(
-            int changeTimeoutMs = 600, int retries = 10, int delayMs = 100)
+            int changeTimeoutMs = 700, int retries = 12, int delayMs = 120)
         {
             uint before = GetClipboardSequenceNumber();
             SimulateCopy();
 
-            var sw = Stopwatch.StartNew();
-            // 轮询剪贴板序号是否变化
-            while (sw.ElapsedMilliseconds < changeTimeoutMs)
+            var start = Environment.TickCount64;
+            while ((Environment.TickCount64 - start) < changeTimeoutMs)
             {
                 uint now = GetClipboardSequenceNumber();
                 if (now != before)
                 {
-                    // 真的变了，再去读文本（带重试，兼容 PDF 慢写）
                     string txt = await ReadAnyTextWithRetryAsync(retries, delayMs);
                     return (true, (txt ?? string.Empty).Trim());
                 }
                 await Task.Delay(40);
             }
-            // 超时：没有变化（说明复制失败/被拦/未选中文本）
             return (false, string.Empty);
         }
 
-        // 读取任何可用文本（Text/UnicodeText/HTML）
-        public static async Task<string> ReadAnyTextWithRetryAsync(int retries = 10, int delayMs = 120)
+        // 读取任何可用文本：UnicodeText/Text/HTML/RTF
+        public static async Task<string> ReadAnyTextWithRetryAsync(int retries = 12, int delayMs = 100)
         {
             for (int i = 0; i < retries; i++)
             {
@@ -77,16 +88,24 @@ namespace BambooTrans.Services
                                 if (!string.IsNullOrWhiteSpace(s)) return s.Trim();
                             }
                         }
+                        if (data.GetDataPresent(DataFormats.Rtf))
+                        {
+                            if (data.GetData(DataFormats.Rtf) is string rtf)
+                            {
+                                var s = CfRtfToPlain(rtf);
+                                if (!string.IsNullOrWhiteSpace(s)) return s.Trim();
+                            }
+                        }
                     }
                 }
-                catch { /* 占用中，稍后重试 */ }
+                catch { /* 占用，稍后重试 */ }
 
                 await Task.Delay(delayMs);
             }
             return string.Empty;
         }
 
-        // --- CF_HTML 粗略转纯文本 ---
+        // ---- 辅助：HTML → 纯文本（粗略）----
         private static string CfHtmlToPlain(string? cfhtml)
         {
             if (string.IsNullOrEmpty(cfhtml)) return string.Empty;
@@ -99,12 +118,31 @@ namespace BambooTrans.Services
             return System.Text.RegularExpressions.Regex.Replace(html, @"\s+", " ").Trim();
         }
 
-        // ---------- Win32 低层 ----------
-        private const ushort VK_CONTROL = 0x11;
+        // ---- 辅助：RTF → 纯文本（用 WPF RichTextBox 解析）----
+        private static string CfRtfToPlain(string rtf)
+        {
+            try
+            {
+                var rtb = new RichTextBox(); // 不必放到可见树
+                var range = new TextRange(rtb.Document.ContentStart, rtb.Document.ContentEnd);
+                // RTF 是 8-bit 文本，尝试 UTF8/ASCII 读取
+                using (var ms = new MemoryStream(Encoding.UTF8.GetBytes(rtf)))
+                {
+                    try { range.Load(ms, DataFormats.Rtf); }
+                    catch
+                    {
+                        ms.Position = 0;
+                        var bytes = Encoding.ASCII.GetBytes(rtf);
+                        using var ms2 = new MemoryStream(bytes);
+                        range.Load(ms2, DataFormats.Rtf);
+                    }
+                }
+                return range.Text ?? string.Empty;
+            }
+            catch { return string.Empty; }
+        }
 
-        private static INPUT KeyDown(ushort vk) => new INPUT { type = 1, U = new InputUnion { ki = new KEYBDINPUT { wVk = vk, dwFlags = 0 } } };
-        private static INPUT KeyUp(ushort vk) => new INPUT { type = 1, U = new InputUnion { ki = new KEYBDINPUT { wVk = vk, dwFlags = 0x0002 } } };
-
+        // ---- Win32 ----
         [DllImport("user32.dll", SetLastError = true)]
         private static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
 
@@ -112,9 +150,14 @@ namespace BambooTrans.Services
 
         [StructLayout(LayoutKind.Sequential)]
         private struct INPUT { public uint type; public InputUnion U; }
+
         [StructLayout(LayoutKind.Explicit)]
         private struct InputUnion { [FieldOffset(0)] public KEYBDINPUT ki; }
+
         [StructLayout(LayoutKind.Sequential)]
         private struct KEYBDINPUT { public ushort wVk; public ushort wScan; public uint dwFlags; public uint time; public IntPtr dwExtraInfo; }
+
+        private static INPUT KeyDown(ushort vk) => new INPUT { type = 1, U = new InputUnion { ki = new KEYBDINPUT { wVk = vk, dwFlags = 0 } } };
+        private static INPUT KeyUp(ushort vk) => new INPUT { type = 1, U = new InputUnion { ki = new KEYBDINPUT { wVk = vk, dwFlags = 0x0002 } } };
     }
 }

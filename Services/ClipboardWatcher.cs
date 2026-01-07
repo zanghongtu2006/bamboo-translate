@@ -1,13 +1,11 @@
 ﻿using System;
-using System.Runtime.InteropServices;
+using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Interop;
+using System.Runtime.InteropServices;
 
 namespace BambooTrans.Services
 {
-    /// <summary>
-    /// 监听系统剪贴板变化（WM_CLIPBOARDUPDATE），当剪贴板有文本时触发事件。
-    /// </summary>
     public sealed class ClipboardWatcher : IDisposable
     {
         private readonly Window _window;
@@ -43,30 +41,14 @@ namespace BambooTrans.Services
             const int WM_CLIPBOARDUPDATE = 0x031D;
             if (msg == WM_CLIPBOARDUPDATE)
             {
-                // 不要在这里做重操作，只尝试拿文本
-                try
+                // 延迟到 UI 线程读取（给写入方时间完成）
+                _ = Application.Current?.Dispatcher.InvokeAsync(async () =>
                 {
-                    var data = System.Windows.Clipboard.GetDataObject();
-                    if (data != null)
-                    {
-                        if (data.GetDataPresent(System.Windows.DataFormats.UnicodeText))
-                        {
-                            if (data.GetData(System.Windows.DataFormats.UnicodeText) is string s && !string.IsNullOrWhiteSpace(s))
-                            {
-                                TextCopied?.Invoke(s);
-                            }
-                        }
-                        else if (data.GetDataPresent(System.Windows.DataFormats.Text))
-                        {
-                            if (data.GetData(System.Windows.DataFormats.Text) is string s && !string.IsNullOrWhiteSpace(s))
-                            {
-                                TextCopied?.Invoke(s);
-                            }
-                        }
-                    }
-                }
-                catch { /* 剪贴板占用时可能抛错，忽略本次 */ }
-                handled = false;
+                    // 适配 IM/PDF：多试几次
+                    string text = await ClipboardHelper.ReadAnyTextWithRetryAsync(retries: 12, delayMs: 100);
+                    if (!string.IsNullOrWhiteSpace(text))
+                        TextCopied?.Invoke(text.Trim());
+                });
             }
             return IntPtr.Zero;
         }

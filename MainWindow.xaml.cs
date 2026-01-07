@@ -12,36 +12,35 @@ namespace BambooTrans
     public partial class MainWindow : Window
     {
         private readonly Translator _translator = new Translator();
+
+        // 钩子 + 剪贴板“序号轮询”监视器
         private GlobalMouseHook? _mouseHook;
-        private ClipboardWatcher? _clipWatcher;
+        private ClipboardPoller? _clipPoller;
 
         // 行为开关
         private bool _smartSelectEnabled = true;   // 划词松开自动翻译
-        private bool _clipAutoEnabled = true;      // 剪贴板变化自动翻译（你按 Ctrl+C 就会触发）
+        private bool _clipAutoEnabled = true;      // 剪贴板变化自动翻译（你手动 Ctrl+C 时触发）
         private bool _useWhitelist = false;        // 默认关闭白名单 => 全局应用生效
 
-        // 去抖/去重/合并
+        // 去抖/去重
         private DateTime _lastTrigger = DateTime.MinValue;
         private string _lastHash = "";
         private DateTime _lastHashAt = DateTime.MinValue;
         private static readonly TimeSpan DuplicateSuppress = TimeSpan.FromSeconds(2);
 
-        // 模式间去重：如果“划词模式”刚触发，短时间内忽略“剪贴板模式”的同文案
+        // 模式间合并抑制：划词触发后 800ms 内忽略相同的“剪贴板变化”触发
         private DateTime _lastSelectAt = DateTime.MinValue;
 
         // 进程白名单（可在菜单切换是否启用）
         private readonly string[] _procWhitelist = {
-            // 浏览器/编辑器
             "chrome","msedge","firefox","notepad","code","winword","excel","powerpnt",
             "wps","wpswriter","wpspdf",
-            // 常见 PDF 阅读器
             "acrord32","acrord64","acrobat","foxit","foxitreader","foxitpdfreader",
             "sumatrapdf","pdfxedit","nitropdf","okular","pdfviewer","edgewebview",
-            // 社交/IM（大部分 Electron/Win32）
             "wechat","wecom","wxwork","whatsapp","telegram","slack","discord","skype","teams","signal"
         };
 
-        // 进程排除（避免自家/系统工具触发）
+        // 进程黑名单（避免自家/系统）
         private readonly string[] _procBlocklist = {
             "bambootrans","explorer","taskmgr","systemsettings","searchapp",
             "applicationframehost","shellexperiencehost","textinputhost","devenv"
@@ -58,32 +57,33 @@ namespace BambooTrans
 
             Loaded += (_, __) =>
             {
-                // ① 全局鼠标钩子：左键松开 → 尝试“划词翻译”
+                // ① 鼠标钩子：左键松开 → 划词翻译
                 _mouseHook = new GlobalMouseHook();
                 _mouseHook.LeftButtonUp += () =>
                     _ = Dispatcher.InvokeAsync(async () => await TrySmartTranslateAsync());
 
-                // ② 剪贴板监听：任意 App 里手动 Ctrl+C → 自动翻译
-                _clipWatcher = new ClipboardWatcher(this);
-                _clipWatcher.TextCopied += async (txt) =>
+                // ② 剪贴板“序号轮询”：任何应用手动 Ctrl+C → 自动翻译
+                //    *不依赖 WM_CLIPBOARDUPDATE，专治 Word/微信/Foxit 这类“延迟/格式化写入”
+                _clipPoller = new ClipboardPoller(intervalMs: 150);
+                _clipPoller.TextChanged += async (txt) =>
                 {
                     if (!_clipAutoEnabled) return;
                     if (string.IsNullOrWhiteSpace(txt)) return;
 
-                    // 合并：若刚刚是“划词模式”触发，剪贴板模式在 800ms 内忽略同样文本
+                    // 与“划词”合并：800ms 内同文案忽略
                     if ((DateTime.UtcNow - _lastSelectAt).TotalMilliseconds < 800)
                     {
                         if (Sha1(txt) == _lastHash) return;
                     }
-
                     await TranslateAndToastAsync(txt.Trim());
                 };
+                _clipPoller.Start();
             };
 
             Closed += (_, __) =>
             {
                 _mouseHook?.Dispose();
-                _clipWatcher?.Dispose();
+                _clipPoller?.Dispose();
             };
         }
 
@@ -97,7 +97,7 @@ namespace BambooTrans
                 if ((DateTime.UtcNow - _lastTrigger).TotalMilliseconds < 120) return;
                 _lastTrigger = DateTime.UtcNow;
 
-                // 当前前台进程
+                // 前台进程过滤
                 string? proc = ForegroundProcessName();
                 if (proc != null && IsInBlocklist(proc)) return;
                 if (_useWhitelist && (proc == null || !IsInWhitelist(proc))) return;
@@ -105,42 +105,49 @@ namespace BambooTrans
                 // 等 60ms 确保选区完成
                 await Task.Delay(60);
 
-                // 针对 PDF/IM 等慢应用拉长节拍
+                // 针对 PDF/IM 适当拉长等待
                 int extra = 0;
                 if (!string.IsNullOrEmpty(proc))
                 {
                     var p = proc.ToLowerInvariant();
                     if (p.Contains("acro") || p.Contains("foxit") || p.Contains("pdf") || p.Contains("xedit") || p.Contains("sumatra"))
                         extra = 300;
+                    if (p.Contains("wechat") || p.Contains("wxwork") || p.Contains("wecom") ||
+                        p.Contains("whatsapp") || p.Contains("telegram") || p.Contains("slack") ||
+                        p.Contains("discord") || p.Contains("teams") || p.Contains("skype") || p.Contains("signal"))
+                        extra = Math.Max(extra, 200);
                 }
 
-                // ① 复制并“等待剪贴板序号改变”，只在确实变更后读取
+                // ① Ctrl+C → 等剪贴板序号变化 → 读取（含 HTML/RTF）
                 var (changed, text) = await ClipboardHelper.CopyThenReadAsync(
-                    changeTimeoutMs: 700 + extra,
-                    retries: (extra > 0 ? 14 : 12),
+                    changeTimeoutMs: 800 + extra,
+                    retries: (extra > 0 ? 16 : 12),
                     delayMs: 120);
 
-                // ② 如果剪贴板没变（复制失败/被拦），用 UIA 直接读“当前选中文本”
+                // ② 未变化 → Ctrl+Insert 再试一轮
+                if (!changed)
+                {
+                    ClipboardHelper.SimulateCopyCtrlInsert();
+                    (changed, text) = await ClipboardHelper.CopyThenReadAsync(
+                        changeTimeoutMs: 800 + extra,
+                        retries: (extra > 0 ? 16 : 12),
+                        delayMs: 120);
+                }
+
+                // ③ 仍未变化 → UIA 直接读“选中文本”
                 if (!changed)
                 {
                     var uia = SelectionReader.TryGetSelectedText();
                     if (!string.IsNullOrWhiteSpace(uia))
-                    {
                         text = uia.Trim();
-                    }
                     else
-                    {
-                        // 两条路都失败：不要用旧剪贴板，直接返回
-                        return;
-                    }
+                        return; // 放弃（不污染旧剪贴板）
                 }
 
                 _lastSelectAt = DateTime.UtcNow;
 
                 if (string.IsNullOrWhiteSpace(text)) return;
-
-                text = text.Trim();
-                await TranslateAndToastAsync(text);
+                await TranslateAndToastAsync(text.Trim());
             }
             catch (Exception ex)
             {
